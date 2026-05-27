@@ -1,901 +1,864 @@
-#!/usr/bin/env python3
-"""
-HMI Virtual Bidireccional - Embobinadora Toroidal
-PySide6 + paho-mqtt
-
-Topics:
-  Publica  → bobibobiutb/cmd
-  Suscribe → bobibobiutb/status
-
-Bidireccionalidad:
-  - Cambios en HMI física se reflejan aquí vía status.config
-  - Cambios aquí se envían al ESP32 vía cmd
-  - Flag _updating_from_mqtt evita bucles de retroalimentación
-"""
-
-import sys
-import json
-import time
-import datetime
+from flask import Flask, render_template_string, request, jsonify
 import paho.mqtt.client as mqtt
+import json
+import threading
+import time
 
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget,
-    QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QPushButton, QDoubleSpinBox, QSpinBox,
-    QTextEdit, QGroupBox, QProgressBar,
-    QSizePolicy, QFrame, QScrollArea
-)
-from PySide6.QtCore import Qt, Signal, QObject, Slot, QTimer
-from PySide6.QtGui import QFont, QColor, QPalette
+app = Flask(__name__)
 
-# ─── CONFIGURACIÓN MQTT ───────────────────────────────────────────────────────
 MQTT_BROKER   = "broker.hivemq.com"
 MQTT_PORT     = 1883
-TOPICO_CMD    = "bobibobiutb/cmd"
-TOPICO_STATUS = "bobibobiutb/status"
-
-# Tiempo máximo sin recibir status antes de marcar ESP32 offline
-ESP32_TIMEOUT_S = 6
-
-# Velocidad: rango continuo 10-100 %
-VEL_MIN  = 10
-VEL_MAX  = 100
-VEL_STEP = 5
-
-# Recarga: cm por vuelta de carrete
-CM_POR_VUELTA = 30.0
-
-# ─── SEÑALES THREAD-SAFE ──────────────────────────────────────────────────────
-class MqttSignals(QObject):
-    """Puente entre el hilo MQTT y el hilo Qt principal."""
-    status_received = Signal(dict)
-    calc_received   = Signal(dict)
-    connected       = Signal()
-    disconnected    = Signal()
-    log             = Signal(str)
-
-
-# ─── WORKER MQTT ─────────────────────────────────────────────────────────────
-class MqttWorker:
-    def __init__(self, signals: MqttSignals):
-        self.signals   = signals
-        self._ready    = False
-        self.client    = mqtt.Client(client_id="HMI-Bobina-Virtual")
-        self.client.on_connect    = self._on_connect
-        self.client.on_disconnect = self._on_disconnect
-        self.client.on_message    = self._on_message
-
-    def connect(self):
-        try:
-            self.client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-            self.client.loop_start()
-        except Exception as exc:
-            self.signals.log.emit(f"[MQTT] Error de conexión: {exc}")
-
-    def disconnect(self):
-        self.client.loop_stop()
-        self.client.disconnect()
-
-    def publish(self, payload: dict):
-        if not self._ready:
-            self.signals.log.emit("[MQTT] No conectado — comando descartado")
-            return
-        msg = json.dumps(payload, separators=(",", ":"))
-        self.client.publish(TOPICO_CMD, msg)
-        self.signals.log.emit(f">> {msg}")
-
-    # ── Callbacks MQTT (hilo de red) ─────────────────────────────────────────
-    def _on_connect(self, client, userdata, flags, rc):
-        if rc == 0:
-            self._ready = True
-            client.subscribe(TOPICO_STATUS)
-            self.signals.connected.emit()
-            self.signals.log.emit("[MQTT] Conectado a broker.hivemq.com")
-        else:
-            self.signals.log.emit(f"[MQTT] Fallo de conexión (rc={rc})")
-
-    def _on_disconnect(self, client, userdata, rc):
-        self._ready = False
-        self.signals.disconnected.emit()
-        self.signals.log.emit(f"[MQTT] Desconectado (rc={rc})")
-
-    def _on_message(self, client, userdata, msg):
-        try:
-            raw  = msg.payload.decode("utf-8")
-            data = json.loads(raw)
-            mtype = data.get("type", "")
-            if mtype == "status":
-                self.signals.status_received.emit(data)
-            elif mtype == "calculation":
-                self.signals.calc_received.emit(data)
-            else:
-                self.signals.log.emit(f"<< {raw}")
-        except Exception as exc:
-            self.signals.log.emit(f"[MQTT] Error parse: {exc}")
-
-
-# =============================================================================
-#  VENTANA PRINCIPAL
-# =============================================================================
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("HMI Virtual — Embobinadora Toroidal")
-        self.setMinimumSize(1050, 720)
-
-        # Flag para evitar que actualizaciones desde MQTT disparen comandos
-        self._updating_from_mqtt = False
-
-        # Timestamp del último status recibido (para detectar ESP32 offline)
-        self._last_esp32_seen: float = 0.0
-
-        # MQTT
-        self.mqtt_signals = MqttSignals()
-        self.mqtt_worker  = MqttWorker(self.mqtt_signals)
-
-        self.mqtt_signals.status_received.connect(self.on_status_received)
-        self.mqtt_signals.calc_received.connect(self.on_calc_received)
-        self.mqtt_signals.connected.connect(self.on_mqtt_connected)
-        self.mqtt_signals.disconnected.connect(self.on_mqtt_disconnected)
-        self.mqtt_signals.log.connect(self.append_log)
-
-        self._build_ui()
-        self.mqtt_worker.connect()
-
-        # Timer para revisar conexión ESP32 cada 3 s
-        self._esp32_timer = QTimer(self)
-        self._esp32_timer.timeout.connect(self._check_esp32_connection)
-        self._esp32_timer.start(3000)
-
-    # =========================================================================
-    #  CONSTRUCCIÓN DE UI
-    # =========================================================================
-    def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        root = QHBoxLayout(central)
-        root.setSpacing(12)
-        root.setContentsMargins(12, 12, 12, 12)
-
-        root.addWidget(self._build_left_panel(), stretch=0)
-        root.addWidget(self._build_right_panel(), stretch=1)
-
-    # ── Panel izquierdo: parámetros + cálculo + recarga + controles ──────────
-    def _build_left_panel(self) -> QWidget:
-        # Scroll area para acomodar todas las secciones sin recortar
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(400)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setStyleSheet("QScrollArea { border: none; }")
-
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setSpacing(10)
-        layout.setContentsMargins(4, 4, 8, 4)
-
-        # ── Banner: sin filamento ────────────────────────────────────────────
-        self.lbl_no_wire_banner = QLabel("⚠  SIN FILAMENTO — Solo modo recarga habilitado")
-        self.lbl_no_wire_banner.setAlignment(Qt.AlignCenter)
-        self.lbl_no_wire_banner.setWordWrap(True)
-        self.lbl_no_wire_banner.setStyleSheet(
-            "background:#c0392b; color:white; border-radius:5px; padding:7px 6px;"
-            "font-weight:bold; font-size:12px; letter-spacing:0.5px;"
-        )
-        self.lbl_no_wire_banner.setVisible(False)
-        layout.addWidget(self.lbl_no_wire_banner)
-
-        # ── Grupo parámetros ────────────────────────────────────────────────
-        self.grp_params = QGroupBox("Parámetros del toroide")
-        grid = QGridLayout(self.grp_params)
-        grid.setColumnStretch(1, 1)
-
-        def lbl(text):
-            l = QLabel(text)
-            l.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            return l
-
-        # D. Externo
-        grid.addWidget(lbl("D. Externo (mm):"), 0, 0)
-        self.spin_od = QDoubleSpinBox()
-        self.spin_od.setRange(30.0, 70.0)
-        self.spin_od.setSingleStep(0.5)
-        self.spin_od.setDecimals(1)
-        self.spin_od.setValue(50.0)
-        grid.addWidget(self.spin_od, 0, 1)
-
-        # D. Interno
-        grid.addWidget(lbl("D. Interno (mm):"), 1, 0)
-        self.spin_id = QDoubleSpinBox()
-        self.spin_id.setRange(25.0, 60.0)
-        self.spin_id.setSingleStep(0.5)
-        self.spin_id.setDecimals(1)
-        self.spin_id.setValue(30.0)
-        grid.addWidget(self.spin_id, 1, 1)
-
-        # Altura
-        grid.addWidget(lbl("Altura (mm):"), 2, 0)
-        self.spin_h = QDoubleSpinBox()
-        self.spin_h.setRange(5.0, 30.0)
-        self.spin_h.setSingleStep(0.5)
-        self.spin_h.setDecimals(1)
-        self.spin_h.setValue(20.0)
-        grid.addWidget(self.spin_h, 2, 1)
-
-        # Vueltas objetivo
-        grid.addWidget(lbl("Vueltas objetivo:"), 3, 0)
-        self.spin_turns = QSpinBox()
-        self.spin_turns.setRange(10, 100)
-        self.spin_turns.setSingleStep(10)
-        self.spin_turns.setValue(100)
-        grid.addWidget(self.spin_turns, 3, 1)
-
-        # Velocidad
-        grid.addWidget(lbl("Velocidad (%):"), 4, 0)
-        self.spin_speed = QSpinBox()
-        self.spin_speed.setRange(VEL_MIN, VEL_MAX)
-        self.spin_speed.setSingleStep(VEL_STEP)
-        self.spin_speed.setValue(70)
-        self.spin_speed.setSuffix(" %")
-        grid.addWidget(self.spin_speed, 4, 1)
-
-        # Diám. alambre (fijo)
-        grid.addWidget(lbl("Diám. alambre:"), 5, 0)
-        lbl_wire = QLabel("0.5 mm  (fijo)")
-        lbl_wire.setStyleSheet("color:#888;")
-        grid.addWidget(lbl_wire, 5, 1)
-
-        layout.addWidget(self.grp_params)
-
-        # ── Advertencia de geometría ─────────────────────────────────────────
-        self.lbl_geometry_warn = QLabel("")
-        self.lbl_geometry_warn.setAlignment(Qt.AlignCenter)
-        self.lbl_geometry_warn.setStyleSheet(
-            "color:white; background:#c0392b; border-radius:4px; padding:4px; font-weight:bold;"
-        )
-        self.lbl_geometry_warn.setVisible(False)
-        layout.addWidget(self.lbl_geometry_warn)
-
-        # ── Resultado de cálculo ──────────────────────────────────────────────
-        # Flujo visual: Params → Geo warn → [Resultado cálculo] → Recarga → Ctrl
-        self.grp_calc = QGroupBox("Resultado de cálculo")
-        cg = QGridLayout(self.grp_calc)
-
-        def clbl(text):
-            l = QLabel(text)
-            l.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            return l
-
-        cg.addWidget(clbl("Long. de alambre:"), 0, 0)
-        self.lbl_wire_len = QLabel("---")
-        cg.addWidget(self.lbl_wire_len, 0, 1)
-
-        cg.addWidget(clbl("Capas usadas:"), 1, 0)
-        self.lbl_max_layers = QLabel("---")
-        cg.addWidget(self.lbl_max_layers, 1, 1)
-
-        cg.addWidget(clbl("Capacidad total:"), 2, 0)
-        self.lbl_total_cap = QLabel("---")
-        cg.addWidget(self.lbl_total_cap, 2, 1)
-
-        cg.addWidget(clbl("Vueltas/capa:"), 3, 0)
-        self.lbl_turns_per_layer = QLabel("---")
-        self.lbl_turns_per_layer.setWordWrap(True)
-        cg.addWidget(self.lbl_turns_per_layer, 3, 1)
-
-        cg.addWidget(clbl("Advertencia:"), 4, 0)
-        self.lbl_calc_warn = QLabel("")
-        self.lbl_calc_warn.setStyleSheet("color:#e67e22;")
-        cg.addWidget(self.lbl_calc_warn, 4, 1)
-
-        layout.addWidget(self.grp_calc)
-
-        # ── Grupo botones de control ─────────────────────────────────────────
-        self.grp_ctrl = QGroupBox("Control")
-        btn_grid = QGridLayout(self.grp_ctrl)
-
-        self.btn_calc  = self._make_btn("Calcular",  "#2980b9")
-        self.btn_start = self._make_btn("Iniciar",   "#27ae60")
-        self.btn_pause = self._make_btn("Pausar",    "#e67e22")
-        self.btn_stop  = self._make_btn("Detener",   "#c0392b")
-        self.btn_reset = self._make_btn("Reset",     "#7f8c8d")
-
-        btn_grid.addWidget(self.btn_calc,  0, 0, 1, 2)
-        btn_grid.addWidget(self.btn_start, 1, 0)
-        btn_grid.addWidget(self.btn_pause, 1, 1)
-        btn_grid.addWidget(self.btn_stop,  2, 0)
-        btn_grid.addWidget(self.btn_reset, 2, 1)
-
-        self.btn_calc.clicked.connect(self.cmd_calculate)
-        self.btn_start.clicked.connect(self.cmd_start)
-        self.btn_pause.clicked.connect(self.cmd_pause)
-        self.btn_stop.clicked.connect(self.cmd_stop)
-        self.btn_reset.clicked.connect(self.cmd_reset)
-
-        # grp_ctrl se agrega al layout DESPUÉS del bloque de recarga (ver abajo)
-
-        # ── Modo Recarga ──────────────────────────────────────────────────────
-        self.grp_reload = QGroupBox("♻ Modo Recarga (carrete)")
-        self.grp_reload.setStyleSheet(
-            "QGroupBox { border:2px solid #7d3c98; border-radius:6px; "
-            "margin-top:8px; font-weight:bold; color:#a569bd; }"
-            "QGroupBox::title { subcontrol-origin:margin; left:10px; padding:0 4px; }"
-        )
-        rg = QGridLayout(self.grp_reload)
-        rg.setColumnStretch(1, 1)
-
-        def rlbl(text):
-            l = QLabel(text)
-            l.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            return l
-
-        # Longitud a recargar
-        rg.addWidget(rlbl("Longitud (cm):"), 0, 0)
-        self.spin_reload_len = QSpinBox()
-        self.spin_reload_len.setRange(10, 3000)
-        self.spin_reload_len.setSingleStep(10)
-        self.spin_reload_len.setValue(300)
-        self.spin_reload_len.setSuffix(" cm")
-        self.spin_reload_len.valueChanged.connect(self._update_reload_turns_label)
-        rg.addWidget(self.spin_reload_len, 0, 1)
-
-        # Vueltas calculadas
-        rg.addWidget(rlbl("Vueltas calc.:"), 1, 0)
-        self.lbl_reload_turns_calc = QLabel("10 vueltas")
-        self.lbl_reload_turns_calc.setStyleSheet("color:#a569bd; font-weight:bold;")
-        rg.addWidget(self.lbl_reload_turns_calc, 1, 1)
-
-        # Progreso de recarga
-        rg.addWidget(rlbl("Progreso:"), 2, 0)
-        self.progress_reload = QProgressBar()
-        self.progress_reload.setRange(0, 100)
-        self.progress_reload.setValue(0)
-        self.progress_reload.setTextVisible(True)
-        self.progress_reload.setStyleSheet(
-            "QProgressBar::chunk { background:#7d3c98; }"
-        )
-        rg.addWidget(self.progress_reload, 2, 1)
-
-        # Estado recarga
-        rg.addWidget(rlbl("Estado:"), 3, 0)
-        self.lbl_reload_state = QLabel("Inactivo")
-        self.lbl_reload_state.setStyleSheet("color:#7f8c8d; font-weight:bold;")
-        rg.addWidget(self.lbl_reload_state, 3, 1)
-
-        # Métricas (vueltas hechas / objetivo)
-        rg.addWidget(rlbl("Vueltas:"), 4, 0)
-        self.lbl_reload_progress = QLabel("0 / 0")
-        rg.addWidget(self.lbl_reload_progress, 4, 1)
-
-        # Botones recarga  (verde=iniciar · naranja=pausar · rojo=cancelar)
-        self.btn_reload_start  = self._make_btn("▶ Iniciar Recarga",  "#27ae60")
-        self.btn_reload_pause  = self._make_btn("⏸ Pausar",           "#e67e22")
-        self.btn_reload_cancel = self._make_btn("✕ Cancelar",         "#c0392b")
-
-        rg.addWidget(self.btn_reload_start,  5, 0, 1, 2)
-        rg.addWidget(self.btn_reload_pause,  6, 0)
-        rg.addWidget(self.btn_reload_cancel, 6, 1)
-
-        self.btn_reload_start.clicked.connect(self.cmd_reload_start)
-        self.btn_reload_pause.clicked.connect(self.cmd_reload_pause)
-        self.btn_reload_cancel.clicked.connect(self.cmd_reload_reset)
-
-        layout.addWidget(self.grp_reload)
-
-        # ── Controles de ejecución ────────────────────────────────────────────
-        layout.addWidget(self.grp_ctrl)
-
-        # Inicializar etiqueta de vueltas calculadas
-        self._update_reload_turns_label()
-
-        # ── Indicadores de conexión ──────────────────────────────────────────
-        conn_box = QGroupBox("Conexión")
-        conn_layout = QGridLayout(conn_box)
-        conn_layout.setContentsMargins(8, 6, 8, 6)
-
-        conn_layout.addWidget(QLabel("Broker MQTT:"), 0, 0)
-        self.lbl_mqtt_status = QLabel("● Conectando…")
-        self.lbl_mqtt_status.setStyleSheet("color:#e67e22; font-weight:bold;")
-        conn_layout.addWidget(self.lbl_mqtt_status, 0, 1)
-
-        conn_layout.addWidget(QLabel("ESP32 / HMI física:"), 1, 0)
-        self.lbl_esp32_status = QLabel("○ Sin datos")
-        self.lbl_esp32_status.setStyleSheet("color:#7f8c8d; font-weight:bold;")
-        conn_layout.addWidget(self.lbl_esp32_status, 1, 1)
-
-        conn_layout.addWidget(QLabel("Último status:"), 2, 0)
-        self.lbl_last_seen = QLabel("—")
-        self.lbl_last_seen.setStyleSheet("color:#7f8c8d; font-size:11px;")
-        conn_layout.addWidget(self.lbl_last_seen, 2, 1)
-
-        layout.addWidget(conn_box)
-
-        # ── Indicador de alambre ─────────────────────────────────────────────
-        self.lbl_wire_sensor = QLabel("● Sensor alambre: —")
-        self.lbl_wire_sensor.setAlignment(Qt.AlignCenter)
-        self.lbl_wire_sensor.setStyleSheet(
-            "background:#1e2025; color:#7f8c8d; border-radius:4px; padding:4px;"
-            "font-weight:bold; font-size:12px;"
-        )
-        layout.addWidget(self.lbl_wire_sensor)
-
-        layout.addStretch()
-        scroll.setWidget(panel)
-        return scroll
-
-    # ── Panel derecho: estado + cálculo + log ────────────────────────────────
-    def _build_right_panel(self) -> QWidget:
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setSpacing(10)
-
-        # ── Estado del sistema ───────────────────────────────────────────────
-        grp_state = QGroupBox("Estado del sistema")
-        sg = QGridLayout(grp_state)
-
-        sg.addWidget(QLabel("Estado:"), 0, 0)
-        self.lbl_state = QLabel("---")
-        self.lbl_state.setFont(QFont("Arial", 14, QFont.Bold))
-        sg.addWidget(self.lbl_state, 0, 1)
-
-        sg.addWidget(QLabel("Progreso:"), 1, 0)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)
-        sg.addWidget(self.progress_bar, 1, 1)
-
-        sg.addWidget(QLabel("Vueltas hechas:"),     2, 0)
-        self.lbl_turns_done = QLabel("0")
-        sg.addWidget(self.lbl_turns_done, 2, 1)
-
-        sg.addWidget(QLabel("Vueltas restantes:"),  3, 0)
-        self.lbl_turns_rem = QLabel("0")
-        sg.addWidget(self.lbl_turns_rem, 3, 1)
-
-        sg.addWidget(QLabel("Velocidad activa:"),   4, 0)
-        self.lbl_speed_active = QLabel("---")
-        sg.addWidget(self.lbl_speed_active, 4, 1)
-
-        sg.addWidget(QLabel("Cálculo:"),            5, 0)
-        self.lbl_calc_flag = QLabel("Pendiente")
-        sg.addWidget(self.lbl_calc_flag, 5, 1)
-
-        sg.addWidget(QLabel("Modo operación:"),      6, 0)
-        self.lbl_modo = QLabel("Bobinado")
-        self.lbl_modo.setStyleSheet("color:#2980b9; font-weight:bold;")
-        sg.addWidget(self.lbl_modo, 6, 1)
-
-        sg.addWidget(QLabel("Advertencia:"),        7, 0)
-        self.lbl_warning = QLabel("")
-        self.lbl_warning.setStyleSheet("color:#c0392b; font-weight:bold;")
-        sg.addWidget(self.lbl_warning, 7, 1)
-
-        layout.addWidget(grp_state)
-
-        # ── Log MQTT ─────────────────────────────────────────────────────────
-        # (Resultado de cálculo movido al panel izquierdo — flujo visual correcto)
-        grp_log = QGroupBox("Log MQTT")
-        lg = QVBoxLayout(grp_log)
-        self.txt_log = QTextEdit()
-        self.txt_log.setReadOnly(True)
-        self.txt_log.setMaximumHeight(180)
-        self.txt_log.setFont(QFont("Courier", 9))
-        lg.addWidget(self.txt_log)
-        layout.addWidget(grp_log)
-
-        # ── Conectar señales de validación ───────────────────────────────────
-        self.spin_od.valueChanged.connect(self._validate_geometry_local)
-        self.spin_id.valueChanged.connect(self._validate_geometry_local)
-
-        return panel
-
-    # ── Helper botones con estilo ─────────────────────────────────────────────
-    @staticmethod
-    def _make_btn(text: str, color: str) -> QPushButton:
-        b = QPushButton(text)
-        b.setMinimumHeight(36)
-        b.setStyleSheet(
-            f"QPushButton {{ background:{color}; color:white; border-radius:5px; "
-            f"font-weight:bold; font-size:13px; }}"
-            f"QPushButton:disabled {{ background:#bdc3c7; color:#888; }}"
-            f"QPushButton:hover {{ opacity:0.85; }}"
-        )
-        return b
-
-    # =========================================================================
-    #  RECARGA — helper etiqueta de vueltas calculadas
-    # =========================================================================
-    def _update_reload_turns_label(self):
-        import math
-        cm  = self.spin_reload_len.value()
-        turns = math.ceil(cm / CM_POR_VUELTA)
-        self.lbl_reload_turns_calc.setText(f"{turns} vueltas")
-
-    # =========================================================================
-    #  BLOQUEO POR ESTADO DE FILAMENTO (FilamentState FSM)
-    # =========================================================================
-    def _set_wire_blocking(self, filament_lock_active: bool, reload_required: bool):
-        """
-        Gestiona el bloqueo de secciones según el estado de filamento del ESP32.
-
-        filament_lock_active=True → SIN filamento → bloquear TODO (incluida recarga)
-        reload_required=True      → filamento vuelve → SOLO recarga habilitada
-        ambos False               → operación normal → todo habilitado
-        """
-        DISABLED_TIP = "Opción deshabilitada: falta filamento"
-        RED_STYLE   = ("background:#c0392b; color:white; border-radius:5px; "
-                       "padding:7px 6px; font-weight:bold; font-size:12px; "
-                       "letter-spacing:0.5px;")
-        ORG_STYLE   = ("background:#e67e22; color:white; border-radius:5px; "
-                       "padding:7px 6px; font-weight:bold; font-size:12px; "
-                       "letter-spacing:0.5px;")
-
-        if filament_lock_active:
-            # ── SIN filamento: TODO bloqueado, ni siquiera se puede recargar ──
-            self.lbl_no_wire_banner.setVisible(True)
-            self.lbl_no_wire_banner.setText(
-                "🚨  SIN FILAMENTO — Inserte alambre para habilitar recarga"
-            )
-            self.lbl_no_wire_banner.setStyleSheet(RED_STYLE)
-            self.grp_params.setEnabled(False)
-            self.grp_params.setToolTip(DISABLED_TIP)
-            self.grp_calc.setEnabled(False)
-            self.grp_calc.setToolTip(DISABLED_TIP)
-            self.grp_reload.setEnabled(False)
-            self.grp_reload.setToolTip("Sin filamento — no se puede iniciar recarga")
-            self.grp_ctrl.setEnabled(False)
-            self.grp_ctrl.setToolTip(DISABLED_TIP)
-
-        elif reload_required:
-            # ── Filamento detectado: SOLO recarga habilitada hasta que termine ─
-            self.lbl_no_wire_banner.setVisible(True)
-            self.lbl_no_wire_banner.setText(
-                "♻  Configure y complete la recarga para volver al modo normal"
-            )
-            self.lbl_no_wire_banner.setStyleSheet(ORG_STYLE)
-            self.grp_params.setEnabled(False)
-            self.grp_params.setToolTip(DISABLED_TIP)
-            self.grp_calc.setEnabled(False)
-            self.grp_calc.setToolTip(DISABLED_TIP)
-            self.grp_reload.setEnabled(True)
-            self.grp_reload.setToolTip("")
-            # Cancelar recarga no permitido en modo obligatorio
-            self.btn_reload_cancel.setEnabled(False)
-            self.btn_reload_cancel.setToolTip("No se puede cancelar: recarga obligatoria")
-            self.grp_ctrl.setEnabled(False)
-            self.grp_ctrl.setToolTip(DISABLED_TIP)
-
-        else:
-            # ── Operación normal ─────────────────────────────────────────────
-            self.lbl_no_wire_banner.setVisible(False)
-            self.grp_params.setEnabled(True)
-            self.grp_params.setToolTip("")
-            self.grp_calc.setEnabled(True)
-            self.grp_calc.setToolTip("")
-            self.grp_reload.setEnabled(True)
-            self.grp_reload.setToolTip("")
-            self.btn_reload_cancel.setEnabled(True)
-            self.btn_reload_cancel.setToolTip("")
-            self.grp_ctrl.setEnabled(True)
-            self.grp_ctrl.setToolTip("")
-
-    # =========================================================================
-    #  VALIDACIÓN GEOMÉTRICA LOCAL (sin enviar MQTT)
-    # =========================================================================
-    def _validate_geometry_local(self):
-        od  = self.spin_od.value()
-        id_ = self.spin_id.value()
-        if id_ >= od:
-            self.lbl_geometry_warn.setText(f"ERROR: D.Int ({id_}) ≥ D.Ext ({od})")
-            self.lbl_geometry_warn.setVisible(True)
-            self.btn_calc.setEnabled(False)
-            self.btn_start.setEnabled(False)
-        else:
-            self.lbl_geometry_warn.setVisible(False)
-            self.btn_calc.setEnabled(True)
-            self.btn_start.setEnabled(True)
-
-    # =========================================================================
-    #  SLOTS MQTT  (ejecutados en el hilo Qt principal gracias a Signal/Slot)
-    # =========================================================================
-    @Slot()
-    def on_mqtt_connected(self):
-        self.lbl_mqtt_status.setText("● Conectado")
-        self.lbl_mqtt_status.setStyleSheet("color:#27ae60; font-weight:bold;")
-
-    @Slot()
-    def on_mqtt_disconnected(self):
-        self.lbl_mqtt_status.setText("○ Desconectado")
-        self.lbl_mqtt_status.setStyleSheet("color:#c0392b; font-weight:bold;")
-        # Si MQTT cae, el ESP32 también queda offline
-        self._set_esp32_offline()
-
-    def _check_esp32_connection(self):
-        """Revisa periódicamente si el ESP32 sigue mandando status."""
-        if self._last_esp32_seen == 0:
-            return  # nunca recibimos nada aún
-        elapsed = time.time() - self._last_esp32_seen
-        if elapsed > ESP32_TIMEOUT_S:
-            self._set_esp32_offline()
-        elif elapsed > 2:
-            # Sigue online pero han pasado varios segundos → mostrar tiempo
-            self.lbl_last_seen.setText(f"hace {int(elapsed)} s")
-            self.lbl_last_seen.setStyleSheet("color:#e67e22; font-size:11px;")
-
-    def _set_esp32_offline(self):
-        elapsed = int(time.time() - self._last_esp32_seen) if self._last_esp32_seen else 0
-        self.lbl_esp32_status.setText("○ Sin respuesta")
-        self.lbl_esp32_status.setStyleSheet("color:#c0392b; font-weight:bold;")
-        self.lbl_last_seen.setText(f"hace {elapsed} s" if elapsed else "—")
-        self.lbl_last_seen.setStyleSheet("color:#c0392b; font-size:11px;")
-        self.lbl_wire_sensor.setText("● Sensor alambre: —")
-        self.lbl_wire_sensor.setStyleSheet(
-            "background:#1e2025; color:#7f8c8d; border-radius:4px; padding:4px;"
-            "font-weight:bold; font-size:12px;"
-        )
-
-    @Slot(dict)
-    def on_status_received(self, data: dict):
-        """Actualiza la UI con el estado publicado por el ESP32."""
-        # Registrar timestamp → usado para detectar ESP32 offline
-        self._last_esp32_seen = time.time()
-        ts = datetime.datetime.now().strftime("%H:%M:%S")
-        self.lbl_last_seen.setText(ts)
-        self.lbl_last_seen.setStyleSheet("color:#27ae60; font-size:11px;")
-        self.lbl_esp32_status.setText("● Conectado (HMI física)")
-        self.lbl_esp32_status.setStyleSheet("color:#27ae60; font-weight:bold;")
-
-        # Activar flag para que los valueChanged de los spinboxes
-        # no disparen comandos MQTT de vuelta al ESP32
-        self._updating_from_mqtt = True
-        try:
-            self._apply_status(data)
-        finally:
-            self._updating_from_mqtt = False
-
-    def _apply_status(self, data: dict):
-        state         = data.get("state", "unknown")
-        turns_done    = data.get("turns_done", 0)
-        turns_rem     = data.get("turns_remaining", 0)
-        progress      = int(data.get("progress_percent", 0))
-        speed         = data.get("speed", 0)
-        calc_pending  = data.get("calculation_pending", True)
-        geo_valid     = data.get("geometry_valid", True)
-        warning       = data.get("warning", "")
-
-        # Estado con color
-        COLOR_MAP = {
-            "ready":     ("#27ae60",  "READY"),
-            "running":   ("#2980b9",  "RUNNING"),
-            "paused":    ("#e67e22",  "PAUSED"),
-            "stopped":   ("#c0392b",  "STOPPED"),
-            "complete":  ("#8e44ad",  "COMPLETE"),
-            "emergency": ("#c0392b",  "EMERGENCY"),
-        }
-        color, label = COLOR_MAP.get(state, ("#555", state.upper()))
-        self.lbl_state.setText(label)
-        self.lbl_state.setStyleSheet(f"color:{color};")
-
-        self.progress_bar.setValue(progress)
-        self.progress_bar.setFormat(f"{progress}%")
-        self.lbl_turns_done.setText(str(turns_done))
-        self.lbl_turns_rem.setText(str(turns_rem))
-        self.lbl_speed_active.setText(f"{speed}%")
-        self.lbl_calc_flag.setText("Listo" if not calc_pending else "Pendiente")
-        self.lbl_calc_flag.setStyleSheet(
-            "color:#27ae60;" if not calc_pending else "color:#e67e22;"
-        )
-        self.lbl_warning.setText(warning)
-
-        # ── Sensor de alambre ─────────────────────────────────────────────
-        wire_present = data.get("wire_present", None)
-        if wire_present is True:
-            self.lbl_wire_sensor.setText("● Sensor alambre: PRESENTE")
-            self.lbl_wire_sensor.setStyleSheet(
-                "background:#152d1f; color:#27ae60; border-radius:4px; padding:4px;"
-                "font-weight:bold; font-size:12px;"
-            )
-        elif wire_present is False:
-            self.lbl_wire_sensor.setText("● Sensor alambre: AUSENTE")
-            self.lbl_wire_sensor.setStyleSheet(
-                "background:#2d1515; color:#e74c3c; border-radius:4px; padding:4px;"
-                "font-weight:bold; font-size:12px;"
-            )
-
-        # ── Bloquear/desbloquear secciones según estado de filamento ─────────
-        filament_lock_active = data.get("filament_lock_active", False)
-        reload_required      = data.get("reload_required",      False)
-        self._set_wire_blocking(filament_lock_active, reload_required)
-
-        # Geometría desde ESP32
-        if not geo_valid:
-            self.lbl_geometry_warn.setText("ERROR geometría reportado por ESP32")
-            self.lbl_geometry_warn.setVisible(True)
-        # No forzamos visible(False) aquí; la validación local lo maneja
-
-        # ── Sincronizar parámetros: ESP32 → HMI virtual ───────────────────
-        cfg = data.get("config", {})
-        if cfg:
-            od  = cfg.get("outer_diameter")
-            id_ = cfg.get("inner_diameter")
-            h   = cfg.get("height")
-            t   = cfg.get("target_turns")
-            spd = cfg.get("speed")
-
-            if od  is not None: self.spin_od.setValue(float(od))
-            if id_ is not None: self.spin_id.setValue(float(id_))
-            if h   is not None: self.spin_h.setValue(float(h))
-            if t   is not None: self.spin_turns.setValue(int(t))
-            if spd is not None:
-                spd_int = max(VEL_MIN, min(VEL_MAX, int(spd)))
-                self.spin_speed.setValue(spd_int)
-
-        # ── Modo de operación ─────────────────────────────────────────────
-        modo = data.get("modo", "bobinado")
-        if modo == "recarga":
-            self.lbl_modo.setText("♻ Recarga")
-            self.lbl_modo.setStyleSheet("color:#a569bd; font-weight:bold;")
-        else:
-            self.lbl_modo.setText("Bobinado")
-            self.lbl_modo.setStyleSheet("color:#2980b9; font-weight:bold;")
-
-        # ── Estado de recarga ─────────────────────────────────────────────
-        modo          = data.get("modo", "bobinado")
-        reload_done   = data.get("reload_done", 0)
-        reload_target = data.get("reload_target", 0)
-        reload_len_cm = data.get("reload_length_cm", None)
-
-        if modo == "recarga":
-            # Sincronizar longitud si viene del ESP32
-            if reload_len_cm is not None:
-                self.spin_reload_len.setValue(int(reload_len_cm))
-
-            # Etiqueta de estado
-            RELOAD_STATE_MAP = {
-                "ready":     ("LISTO",       "#a569bd"),
-                "running":   ("RECARGANDO",  "#7d3c98"),
-                "paused":    ("PAUSADO",     "#e67e22"),
-                "stopped":   ("DETENIDO",    "#c0392b"),
-                "complete":  ("COMPLETO ✓",  "#27ae60"),
-                "emergency": ("EMERGENCIA",  "#c0392b"),
+TOPIC_CMD     = "bobibobiutb/cmd"
+TOPIC_STATUS  = "bobibobiutb/status"
+
+mqtt_client = mqtt.Client()
+mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+
+latest_status = {
+    "type": "status",
+    "turns_done": 0,
+    "turns_remaining": 0,
+    "turns_total": 0,
+    "state": "ready",
+    "endstop": False,
+    "hall": False,
+    "speed": 0,
+    "direction": "S",
+    "modo": "bobinado",
+    "reload_done": 0,
+    "reload_target": 0,
+    "reload_length_cm": 300,
+    "filament_lock_active": False,
+    "reload_required": False,
+    "filament_state": "startup"
+}
+
+calculation_result = {
+    "wire_length_m": 0,
+    "turns_per_layer": 0,
+    "max_layers": 0,
+    "total_capacity": 0,
+    "warning": ""
+}
+
+def on_message(client, userdata, msg):
+    global latest_status, calculation_result
+    try:
+        data = json.loads(msg.payload.decode())
+        print(f"[MQTT←] {data}")
+        if data.get("type") == "status":
+            latest_status.update(data)
+        elif data.get("type") == "calculation":
+            calculation_result = {
+                "wire_length_m":  data.get("wire_length_m", 0),
+                "turns_per_layer": data.get("turns_per_layer", 0),
+                "max_layers":     data.get("max_layers", 0),
+                "total_capacity": data.get("total_capacity", 0),
+                "warning":        data.get("warning", "")
             }
-            rs_color = RELOAD_STATE_MAP.get(state, ("---", "#7f8c8d"))
-            self.lbl_reload_state.setText(rs_color[0])
-            self.lbl_reload_state.setStyleSheet(f"color:{rs_color[1]}; font-weight:bold;")
+    except Exception as e:
+        print(f"[MQTT] Error procesando mensaje: {e}")
 
-            # Progreso
-            if reload_target > 0:
-                pct = min(100, int(reload_done * 100 / reload_target))
-                self.progress_reload.setValue(pct)
-                self.progress_reload.setFormat(f"{pct}%")
-                self.lbl_reload_progress.setText(f"{reload_done} / {reload_target}")
-            else:
-                self.progress_reload.setValue(0)
-                self.lbl_reload_progress.setText("0 / 0")
-        else:
-            # Modo bobinado normal — resetear indicadores de recarga si no estamos en ese modo
-            self.lbl_reload_state.setText("Inactivo")
-            self.lbl_reload_state.setStyleSheet("color:#7f8c8d; font-weight:bold;")
+mqtt_client.on_message = on_message
+mqtt_client.subscribe(TOPIC_STATUS)
+mqtt_client.loop_start()
 
-        # Re-validar geometría con los nuevos valores
-        self._validate_geometry_local()
-
-    @Slot(dict)
-    def on_calc_received(self, data: dict):
-        """Muestra el resultado de cálculo publicado por el ESP32."""
-        wire_len  = data.get("wire_length_m", 0)
-        max_lyr   = data.get("max_layers", 0)
-        total_cap = data.get("total_capacity", 0)
-        tpl       = data.get("turns_per_layer", "---")
-        warn      = data.get("warning", "")
-
-        self.lbl_wire_len.setText(f"{wire_len:.2f} m")
-        self.lbl_max_layers.setText(str(max_lyr))
-        self.lbl_total_cap.setText(str(total_cap))
-        self.lbl_turns_per_layer.setText(tpl if tpl else "---")
-        self.lbl_calc_warn.setText(warn)
-
-    @Slot(str)
-    def append_log(self, msg: str):
-        self.txt_log.append(msg)
-        self.txt_log.verticalScrollBar().setValue(
-            self.txt_log.verticalScrollBar().maximum()
-        )
-
-    # =========================================================================
-    #  ENVÍO DE COMANDOS MQTT
-    # =========================================================================
-    def cmd_calculate(self):
-        """Envía 'calculate' con los parámetros actuales de la HMI virtual."""
-        if self._updating_from_mqtt:
-            return
-        od  = self.spin_od.value()
-        id_ = self.spin_id.value()
-        if id_ >= od:
-            self.lbl_geometry_warn.setText("ERROR: D.Int >= D.Ext — no se puede calcular")
-            self.lbl_geometry_warn.setVisible(True)
-            return
-        payload = {
-            "cmd": "calculate",
-            "toroid": {
-                "outer_diameter": od,
-                "inner_diameter": id_,
-                "height":         self.spin_h.value(),
-            },
-            "wire_diameter": 0.5,
-            "target_turns":  self.spin_turns.value(),
+# ─────────────────────────────────────────────────────────────────────────────
+#  PLANTILLA HTML
+# ─────────────────────────────────────────────────────────────────────────────
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SISTEMA DE CONTROL - EMBOBINADORA TOROIDAL</title>
+    <style>
+        :root {
+            --gris-maquina: #b0b0b0;
+            --gris-oscuro:  #808080;
+            --gris-claro:   #d9d9d9;
+            --azul-utb:     #0033a0;
+            --negro-panel:  #1a1a1a;
+            --blanco-puro:  #ffffff;
+            --rojo-error:   #c0392b;
+            --verde-ok:     #27ae60;
         }
-        self.mqtt_worker.publish(payload)
 
-    def cmd_start(self):
-        """Envía 'start' con la velocidad seleccionada."""
-        if self._updating_from_mqtt:
-            return
-        speed = self.spin_speed.value()
-        self.mqtt_worker.publish({"cmd": "start", "speed": speed})
+        * { margin:0; padding:0; box-sizing:border-box; font-family:'Courier New',Courier,monospace; }
+        body { background-color:#ffffff; color:var(--negro-panel); padding:20px; }
 
-    def cmd_pause(self):
-        self.mqtt_worker.publish({"cmd": "pause"})
+        .container {
+            max-width:1200px; margin:0 auto;
+            background-color:#ffffff;
+            border:4px solid var(--gris-claro);
+            border-right-color:var(--gris-oscuro);
+            border-bottom-color:var(--gris-oscuro);
+            padding:15px;
+            box-shadow:10px 10px 0px rgba(0,0,0,0.15);
+        }
 
-    def cmd_stop(self):
-        self.mqtt_worker.publish({"cmd": "stop"})
+        header {
+            background-color:var(--azul-utb); color:var(--blanco-puro);
+            padding:15px; border:3px inset rgba(255,255,255,0.2);
+            margin-bottom:20px;
+            display:flex; justify-content:space-between; align-items:center;
+        }
+        header h1 { font-size:1.8em; letter-spacing:-1px; }
+        header .subtitle {
+            font-size:0.8em; text-transform:uppercase;
+            border-top:1px solid var(--blanco-puro);
+            padding-top:5px; margin-top:5px;
+        }
 
-    def cmd_reset(self):
-        self.mqtt_worker.publish({"cmd": "reset"})
+        /* Badge de estado del servidor */
+        .srv-badge {
+            font-size:0.75em; font-weight:bold; padding:5px 12px;
+            border:2px outset rgba(255,255,255,0.3); white-space:nowrap;
+            text-align:center; min-width:130px;
+        }
+        .srv-badge.online  { background:#1a5c1a; color:#00ff00; }
+        .srv-badge.offline { background:#5c1a1a; color:#ff6666; }
 
-    def cmd_reload_start(self):
-        """Inicia el modo recarga con la longitud configurada."""
-        if self._updating_from_mqtt:
-            return
-        import math
-        length_cm = self.spin_reload_len.value()
-        turns     = math.ceil(length_cm / CM_POR_VUELTA)
-        self.mqtt_worker.publish({
-            "cmd":           "reload_start",
-            "length_cm":     length_cm,
-            "target_turns":  turns,
-            "speed":         self.spin_speed.value(),
+        .grid { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+
+        .card {
+            background-color:#ffffff;
+            border:3px outset var(--gris-claro); padding:20px;
+        }
+        .card h2 {
+            background-color:var(--gris-oscuro); color:var(--blanco-puro);
+            font-size:1em; padding:5px 10px; margin-bottom:15px;
+            border:2px inset var(--gris-claro);
+        }
+
+        /* ── Reload card ── */
+        .reload-card {
+            background-color:#ffffff;
+            border:3px outset var(--gris-claro);
+            padding:20px; margin-top:15px;
+        }
+        .reload-card h2 {
+            background-color:var(--gris-oscuro); color:var(--blanco-puro);
+            font-size:1em; padding:5px 10px; margin-bottom:15px;
+            border:2px inset var(--gris-claro);
+        }
+        .reload-progress-container {
+            background:#222; border:2px solid #00ff00;
+            height:26px; margin:8px 0; display:none;
+        }
+        .reload-progress-bar {
+            height:100%; background-color:#00ff00; color:black; font-weight:bold;
+            display:flex; align-items:center; justify-content:center;
+            min-width:30px; transition:width 0.5s ease;
+        }
+        .reload-info-grid {
+            display:grid; grid-template-columns:1fr 1fr 1fr; gap:5px; margin:8px 0;
+        }
+        .reload-info-item {
+            border:1px solid #004400; padding:5px;
+            font-size:0.8em; background:var(--negro-panel); color:#00ff00;
+        }
+        .reload-state-display {
+            background:var(--negro-panel); color:#00ff00;
+            border:2px solid #00ff00; padding:6px 10px;
+            font-size:0.85em; margin-bottom:8px; text-align:center; display:none;
+        }
+        .btn-reload-start  { background-color:var(--azul-utb); color:white; width:100%; margin-bottom:8px; }
+        .btn-reload-pause  { background-color:#f1c40f; color:black; }
+        .btn-reload-cancel { background-color:var(--gris-oscuro); color:white; }
+
+        .input-group {
+            margin-bottom:10px; display:flex;
+            align-items:center; justify-content:space-between; flex-wrap:wrap; gap:4px;
+        }
+        label { font-weight:bold; font-size:0.85em; text-transform:uppercase; flex:1; }
+
+        input[type="number"] {
+            width:100px; background-color:var(--blanco-puro);
+            border:3px inset var(--gris-oscuro); padding:5px; font-weight:bold;
+            color:var(--negro-panel); text-align:center; transition:border-color 0.2s;
+        }
+        input.input-error { border-color:var(--rojo-error)!important; background-color:#fdecea; }
+        input.input-ok    { border-color:var(--verde-ok)!important; }
+
+        .field-error {
+            font-size:0.72em; color:var(--rojo-error);
+            font-weight:bold; width:100%; text-align:right; display:none;
+        }
+        .field-error.visible { display:block; }
+
+        button {
+            border:4px outset var(--gris-claro); background-color:var(--gris-claro);
+            padding:12px; font-weight:bold; cursor:pointer;
+            text-transform:uppercase; transition:all 0.1s;
+            font-family:'Courier New',Courier,monospace;
+        }
+        button:active   { border-style:inset; transform:translate(2px,2px); }
+        button:disabled { opacity:0.4; cursor:not-allowed; transform:none!important; }
+
+        .btn-calculate { background-color:var(--azul-utb); color:white; width:100%; margin-top:10px; }
+        .button-group  { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+        .btn-start { background-color:#2ecc71; color:white; }
+        .btn-pause { background-color:#f1c40f; color:black; }
+        .btn-stop  { background-color:#e74c3c; color:white; }
+        .btn-reset { background-color:var(--gris-oscuro); color:white; }
+
+        .toast {
+            display:none; margin-top:10px; padding:8px 12px;
+            font-size:0.82em; font-weight:bold; border-left:4px solid;
+        }
+        .toast.error   { background:#fdecea; border-color:var(--rojo-error); color:var(--rojo-error); display:block; }
+        .toast.warning { background:#fff8e1; border-color:#f39c12;           color:#7d5a00;            display:block; }
+        .toast.success { background:#eafaf1; border-color:var(--verde-ok);   color:#1a6e3a;            display:block; }
+
+        /* Panel de estado */
+        .status-panel {
+            background-color:var(--negro-panel); color:#00ff00;
+            border:6px solid var(--gris-oscuro); padding:15px;
+        }
+        .status-main {
+            border:2px solid #00ff00; padding:10px;
+            margin-bottom:15px; text-align:center;
+        }
+        .state-value { font-size:2em; font-weight:bold; }
+        .progress-bar-container { background:#222; border:2px solid #00ff00; height:30px; margin:10px 0; }
+        .progress-bar {
+            height:100%; background-color:#00ff00; color:black; font-weight:bold;
+            display:flex; align-items:center; justify-content:center; min-width:30px;
+        }
+        .info-grid { display:grid; grid-template-columns:1fr 1fr; gap:5px; }
+        .info-item { border:1px solid #004400; padding:5px; font-size:0.8em; }
+        .sensor-status { padding:2px 5px; border:1px solid #00ff00; }
+        .sensor-active { background-color:#00ff00; color:black; }
+
+        .checklist {
+            background:var(--negro-panel); border:2px solid #444;
+            padding:10px; margin-top:12px;
+        }
+        .checklist-title { color:#aaa; font-size:0.75em; margin-bottom:6px; text-transform:uppercase; }
+        .check-item { font-size:0.78em; padding:3px 0; display:flex; align-items:center; gap:6px; }
+        .check-ok   { color:#00ff00; }
+        .check-fail { color:#ff4444; }
+        .check-warn { color:#f1c40f; }
+
+        .results-panel {
+            background-color:var(--blanco-puro); border:3px inset var(--gris-oscuro);
+            margin-top:15px; padding:10px; color:var(--negro-panel); display:none;
+        }
+        .result-item { border-bottom:1px dashed var(--gris-oscuro); padding:3px 0; font-size:0.85em; }
+
+        /* ── Overlay bloqueo por falta de filamento ── */
+        .block-wrap { position:relative; }
+        .block-overlay {
+            display:none; position:absolute;
+            top:0; left:0; right:0; bottom:0;
+            background:rgba(160,20,10,0.88);
+            z-index:200; align-items:center; justify-content:center;
+            border:4px solid #e74c3c;
+        }
+        .block-overlay.active { display:flex; }
+        .block-msg {
+            color:#ffffff; font-size:1.3em; font-weight:bold;
+            text-align:center; padding:22px 28px;
+            border:3px outset rgba(255,255,255,0.25);
+            background:rgba(0,0,0,0.35); letter-spacing:3px;
+            line-height:1.6; text-shadow:0 0 12px #ff2222;
+        }
+        .block-msg span {
+            display:block; font-size:0.58em; letter-spacing:1px;
+            margin-top:6px; color:#ffaaaa; font-weight:normal;
+        }
+
+        /* Banner global */
+        #globalBlockBanner {
+            display:none; background:#c0392b; color:white;
+            font-weight:bold; font-size:1em; text-align:center;
+            padding:10px; border:3px outset #e74c3c;
+            margin-bottom:14px; letter-spacing:2px;
+        }
+        #globalBlockBanner.active { display:block; }
+
+        footer {
+            margin-top:20px; background-color:var(--gris-oscuro);
+            color:var(--blanco-puro); padding:10px;
+            font-size:0.7em; text-align:center;
+            border:2px inset var(--gris-claro);
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+
+    <header>
+        <div>
+            <h1>CONTROLADOR INDUSTRIAL V1.0 - UTB</h1>
+            <div class="subtitle">Embedded System ESP32 // Toroidal Winding Control</div>
+        </div>
+        <div class="srv-badge offline" id="srvBadge">○ SIN SERVIDOR</div>
+    </header>
+
+    <!-- Banner global de bloqueo -->
+    <div id="globalBlockBanner">🔒 &nbsp; SIN FILAMENTO — SISTEMA BLOQUEADO &nbsp; 🔒</div>
+
+    <div class="grid">
+
+        <!-- ═══ COLUMNA IZQUIERDA: PARÁMETROS + RECARGA ═══ -->
+        <div class="block-wrap card" id="cardParams">
+            <div class="block-overlay" id="overlayParams">
+                <div class="block-msg">🔒 SISTEMA BLOQUEADO<span>Opción deshabilitada — falta filamento</span></div>
+            </div>
+
+            <h2>[ PARÁMETROS DE ENTRADA ]</h2>
+
+            <div class="input-group">
+                <label>D. EXTERIOR (mm)</label>
+                <input type="number" id="outer"  value="59.5" min="1"    step="0.1"  oninput="validateField(this)">
+                <span class="field-error" id="err-outer"></span>
+            </div>
+            <div class="input-group">
+                <label>D. INTERIOR (mm)</label>
+                <input type="number" id="inner"  value="39.5" min="1"    step="0.1"  oninput="validateField(this)">
+                <span class="field-error" id="err-inner"></span>
+            </div>
+            <div class="input-group">
+                <label>ALTURA (mm)</label>
+                <input type="number" id="height" value="20"   min="0.1"  step="0.1"  oninput="validateField(this)">
+                <span class="field-error" id="err-height"></span>
+            </div>
+            <div class="input-group">
+                <label>D. ALAMBRE (mm)</label>
+                <input type="number" id="wire"   value="0.3"  min="0.01" step="0.01" oninput="validateField(this)">
+                <span class="field-error" id="err-wire"></span>
+            </div>
+            <div class="input-group">
+                <label>VUELTAS OBJ.</label>
+                <input type="number" id="turns"  value="5"    min="1"    step="1"    oninput="validateField(this)">
+                <span class="field-error" id="err-turns"></span>
+            </div>
+            <div class="input-group">
+                <label>MOTOR VEL (%)</label>
+                <input type="number" id="speed"  value="70"   min="10"   max="100" step="1" oninput="validateField(this)">
+                <span class="field-error" id="err-speed"></span>
+            </div>
+
+            <div class="toast" id="calcToast"></div>
+            <button class="btn-calculate" onclick="calculate()">EJECUTAR CÁLCULO</button>
+
+            <div class="results-panel" id="resultsPanel">
+                <strong>>> REPORTE DE CÁLCULO:</strong>
+                <div class="result-item">LONG. ALAMBRE:  <span id="wireLength">--</span></div>
+                <div class="result-item">VUELTAS/CAPA:   <span id="turnsPerLayer">--</span></div>
+                <div class="result-item">CAPAS MÁX:      <span id="maxLayers">--</span></div>
+                <div class="result-item">CAPACIDAD TOT:  <span id="totalCapacity">--</span></div>
+                <div id="warningMsg" style="color:red;font-weight:bold;margin-top:5px;"></div>
+            </div>
+
+            <!-- MODO RECARGA — debajo del reporte de cálculo -->
+            <div class="reload-card" id="reloadCard">
+                <h2>[ MODO RECARGA DE CARRETE ]</h2>
+                <div class="input-group">
+                    <label>LONGITUD (cm)</label>
+                    <input type="number" id="reloadLen" value="300" min="10" max="3000" step="10"
+                           oninput="updateReloadCalc()">
+                </div>
+                <div style="font-size:0.78em;margin:4px 0 10px;font-weight:bold;">
+                    VUELTAS CALCULADAS:
+                    <span id="reloadCalcTurns" style="color:var(--azul-utb);">10</span>
+                    &nbsp;(30 cm/vuelta)
+                </div>
+
+                <div class="reload-state-display" id="reloadStateDisplay">
+                    ESTADO: <span id="reloadStateText">INACTIVO</span>
+                </div>
+                <div class="reload-progress-container" id="reloadProgressContainer">
+                    <div class="reload-progress-bar" id="reloadProgressBar" style="width:0%;">
+                        <span id="reloadProgressText">0%</span>
+                    </div>
+                </div>
+                <div class="reload-info-grid" id="reloadInfoGrid" style="display:none;">
+                    <div class="reload-info-item">VUELTAS: <span id="reloadDone">0</span></div>
+                    <div class="reload-info-item">OBJ: <span id="reloadTarget">0</span></div>
+                    <div class="reload-info-item">LEN: <span id="reloadLenDisplay">--</span></div>
+                </div>
+
+                <button class="btn-calculate btn-reload-start" onclick="reloadStart()">
+                    &#8635; INICIAR RECARGA
+                </button>
+                <div class="button-group">
+                    <button class="btn-pause btn-reload-pause" id="btnReloadPause"
+                            onclick="reloadPause()" disabled>PAUSAR</button>
+                    <button class="btn-reset btn-reload-cancel" id="btnReloadCancel"
+                            onclick="reloadReset()">CANCELAR</button>
+                </div>
+                <div class="toast" id="reloadToast" style="margin-top:8px;"></div>
+            </div>
+
+        </div><!-- fin columna izquierda -->
+
+        <!-- ═══ COLUMNA DERECHA: OPERACIÓN + ESTADO ═══ -->
+        <div>
+            <div class="block-wrap card" style="margin-bottom:20px;" id="cardOp">
+                <div class="block-overlay" id="overlayOp">
+                    <div class="block-msg">🔒 SISTEMA BLOQUEADO<span>Opción deshabilitada — falta filamento</span></div>
+                </div>
+                <h2>[ PANEL DE OPERACIÓN ]</h2>
+                <div class="button-group">
+                    <button class="btn-start" id="btnStart" onclick="startWinding()" disabled>START</button>
+                    <button class="btn-pause" id="btnPause" onclick="sendCmd('pause')"  disabled>PAUSE</button>
+                    <button class="btn-stop"  id="btnStop"  onclick="sendCmd('stop')"   disabled>STOP</button>
+                    <button class="btn-reset" onclick="resetSystem()">RESET</button>
+                </div>
+                <div class="checklist">
+                    <div class="checklist-title">▸ PRE-ARRANQUE</div>
+                    <div class="check-item" id="chk-calc">
+                        <span class="icon">✗</span><span>Cálculo ejecutado</span>
+                    </div>
+                    <div class="check-item" id="chk-endstop">
+                        <span class="icon">✗</span><span>Final de carrera libre</span>
+                    </div>
+                    <div class="check-item" id="chk-capacity">
+                        <span class="icon">—</span><span>Vueltas dentro de capacidad</span>
+                    </div>
+                    <div class="check-item" id="chk-wire">
+                        <span class="icon">—</span><span>Longitud de cobre calculada</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="block-wrap" id="wrapStatus">
+                <div class="block-overlay" id="overlayStatus">
+                    <div class="block-msg">🔒 SISTEMA BLOQUEADO<span>Opción deshabilitada — falta filamento</span></div>
+                </div>
+                <div class="status-panel">
+                    <div class="status-main">
+                        <div style="font-size:0.7em;">MODO SISTEMA</div>
+                        <div class="state-value" id="stateDisplay">READY</div>
+                    </div>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar" id="progressBar" style="width:0%;">
+                            <span id="progressText">0%</span>
+                        </div>
+                    </div>
+                    <div class="info-grid">
+                        <div class="info-item">HECHAS: <span id="turnsDone">0</span></div>
+                        <div class="info-item">RESTAN: <span id="turnsRemaining">0</span></div>
+                        <div class="info-item">META:   <span id="turnsTotal">0</span></div>
+                        <div class="info-item">VEL:    <span id="speedValue">0%</span></div>
+                        <div class="info-item">F.CARRERA: <span class="sensor-status" id="endstopStatus">OFF</span></div>
+                        <div class="info-item">HALL: <span class="sensor-status" id="hallStatus">OFF</span></div>
+                    </div>
+                </div>
+            </div>
+        </div><!-- fin columna derecha -->
+
+    </div><!-- fin grid -->
+
+    <footer>
+        LOG: HTTP POLLING // FLASK-MQTT BRIDGE // TOPIC: bobibobiutb/* // 2026 INDUSTRIAL CONTROL SYSTEMS
+    </footer>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  ESTADO LOCAL
+// ═══════════════════════════════════════════════════════════════
+let calcDone       = false;
+let calcResult     = null;
+let currentState   = 'ready';
+let endstopActive  = false;
+let calcToastShown = false;
+
+// ═══════════════════════════════════════════════════════════════
+//  REGLAS DE VALIDACIÓN
+// ═══════════════════════════════════════════════════════════════
+const FIELD_RULES = {
+    outer:  { min:1,    max:500,   step:0.1,  integer:false },
+    inner:  { min:1,    max:499,   step:0.1,  integer:false },
+    height: { min:0.1,  max:200,   step:0.1,  integer:false },
+    wire:   { min:0.01, max:10,    step:0.01, integer:false },
+    turns:  { min:1,    max:99999, step:1,    integer:true  },
+    speed:  { min:10,   max:100,   step:1,    integer:true  },
+};
+
+function validateField(input) {
+    const id = input.id, rules = FIELD_RULES[id];
+    if (!rules) return true;
+    const errEl = document.getElementById('err-' + id);
+    const val   = parseFloat(input.value);
+    let   msg   = '';
+
+    if (input.value === '' || isNaN(val))          msg = '⚠ Campo obligatorio';
+    else if (val < 0)                              msg = '✗ No se permiten negativos';
+    else if (val < rules.min)                      msg = `✗ Mínimo: ${rules.min}`;
+    else if (val > rules.max)                      msg = `✗ Máximo: ${rules.max}`;
+    else if (rules.integer && !Number.isInteger(val)) msg = '✗ Debe ser entero';
+
+    if (msg) {
+        input.classList.add('input-error'); input.classList.remove('input-ok');
+        errEl.textContent = msg; errEl.classList.add('visible');
+    } else {
+        input.classList.remove('input-error'); input.classList.add('input-ok');
+        errEl.textContent = ''; errEl.classList.remove('visible');
+    }
+    validateGeometry();
+    return msg === '';
+}
+
+function validateGeometry() {
+    const outer = parseFloat(document.getElementById('outer').value);
+    const inner = parseFloat(document.getElementById('inner').value);
+    const wire  = parseFloat(document.getElementById('wire').value);
+    if (!isNaN(outer) && !isNaN(inner) && inner >= outer) {
+        document.getElementById('inner').classList.add('input-error');
+        const e = document.getElementById('err-inner');
+        e.textContent = '✗ Debe ser menor que D. Exterior'; e.classList.add('visible');
+    }
+    if (!isNaN(outer) && !isNaN(inner) && !isNaN(wire)) {
+        const win = (outer - inner) / 2;
+        if (wire > win) {
+            document.getElementById('wire').classList.add('input-error');
+            const e = document.getElementById('err-wire');
+            e.textContent = `✗ No cabe en ventana (${win.toFixed(2)}mm)`; e.classList.add('visible');
+        }
+    }
+}
+
+function validateAll() {
+    let ok = true;
+    Object.keys(FIELD_RULES).forEach(id => { if (!validateField(document.getElementById(id))) ok = false; });
+    const o = parseFloat(document.getElementById('outer').value);
+    const i = parseFloat(document.getElementById('inner').value);
+    if (!isNaN(o) && !isNaN(i) && i >= o) ok = false;
+    return ok;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TOAST
+// ═══════════════════════════════════════════════════════════════
+function showToast(msg, type) {
+    const t = document.getElementById('calcToast');
+    t.textContent = msg; t.className = 'toast ' + type;
+}
+function showReloadToast(msg, type) {
+    const el = document.getElementById('reloadToast');
+    el.textContent = msg; el.className = 'toast ' + type;
+    setTimeout(() => { el.className = 'toast'; }, 4000);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CHECKLIST PRE-ARRANQUE
+// ═══════════════════════════════════════════════════════════════
+function updateChecklist() {
+    const turns = parseInt(document.getElementById('turns').value);
+    setCheck('chk-calc',    calcDone,       calcDone ? 'Cálculo ejecutado' : 'Cálculo pendiente');
+    setCheck('chk-endstop', !endstopActive, endstopActive ? 'Final de carrera ACTIVO ⚠' : 'Final de carrera libre');
+    if (calcResult) {
+        const ok = turns <= calcResult.total_capacity;
+        setCheck('chk-capacity', ok,
+            ok ? `Vueltas OK (cap: ${calcResult.total_capacity})`
+               : `Excede capacidad (${calcResult.total_capacity} máx)`);
+    } else {
+        setCheckNeutral('chk-capacity', 'Vueltas dentro de capacidad');
+    }
+    if (calcResult && calcResult.wire_length_m > 0) {
+        setCheck('chk-wire', true, `Cobre necesario: ${calcResult.wire_length_m.toFixed(2)} m`);
+    } else {
+        setCheckNeutral('chk-wire', 'Longitud de cobre calculada');
+    }
+    const canStart = calcDone && !endstopActive
+                  && currentState !== 'running' && currentState !== 'emergency'
+                  && (calcResult ? turns <= calcResult.total_capacity : false);
+    document.getElementById('btnStart').disabled = !canStart;
+}
+
+function setCheck(id, ok, label) {
+    const el = document.getElementById(id);
+    el.className = 'check-item ' + (ok ? 'check-ok' : 'check-fail');
+    el.innerHTML = `<span class="icon">${ok ? '✔' : '✗'}</span><span>${label}</span>`;
+}
+function setCheckNeutral(id, label) {
+    const el = document.getElementById(id);
+    el.className = 'check-item check-warn';
+    el.innerHTML = `<span class="icon">—</span><span>${label}</span>`;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  COMUNICACIÓN HTTP → FLASK
+// ═══════════════════════════════════════════════════════════════
+function postControl(payload) {
+    fetch('/control', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(payload)
+    }).catch(err => { console.error('[HTTP] Error:', err); showToast('✗ Sin conexión con el servidor', 'error'); });
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ACCIONES
+// ═══════════════════════════════════════════════════════════════
+function calculate() {
+    if (!validateAll()) { showToast('✗ Corrija los errores antes de calcular', 'error'); return; }
+    const outer = parseFloat(document.getElementById('outer').value);
+    const inner = parseFloat(document.getElementById('inner').value);
+    if (inner >= outer) { showToast('✗ D. Interior debe ser menor que D. Exterior', 'error'); return; }
+    calcToastShown = false;
+    showToast('⟳ Enviando al ESP32...', 'warning');
+    postControl({
+        cmd: 'calculate',
+        toroid: { outer_diameter: outer, inner_diameter: inner,
+                  height: parseFloat(document.getElementById('height').value) },
+        wire_diameter: parseFloat(document.getElementById('wire').value),
+        target_turns:  parseInt(document.getElementById('turns').value)
+    });
+}
+
+function startWinding() {
+    if (!calcDone)       { showToast('✗ Ejecute el cálculo primero', 'error'); return; }
+    if (endstopActive)   { showToast('✗ Final de carrera activo — libérelo antes', 'error'); return; }
+    const turns = parseInt(document.getElementById('turns').value);
+    if (calcResult && turns > calcResult.total_capacity) {
+        showToast(`✗ Vueltas (${turns}) exceden capacidad (${calcResult.total_capacity})`, 'error'); return;
+    }
+    sendCmd('start');
+}
+
+function resetSystem() {
+    calcDone = false; calcResult = null; calcToastShown = false;
+    document.getElementById('resultsPanel').style.display = 'none';
+    document.getElementById('warningMsg').textContent = '';
+    Object.keys(FIELD_RULES).forEach(id => {
+        const el = document.getElementById(id);
+        el.classList.remove('input-ok', 'input-error');
+        document.getElementById('err-' + id).classList.remove('visible');
+    });
+    showToast('Sistema reseteado', 'warning');
+    sendCmd('reset');
+    updateChecklist();
+}
+
+function sendCmd(cmd) {
+    const payload = { cmd };
+    if (cmd === 'start') payload.speed = parseInt(document.getElementById('speed').value) || 70;
+    postControl(payload);
+}
+
+function updateButtons(state) {
+    document.getElementById('btnPause').disabled = (state !== 'running');
+    document.getElementById('btnStop').disabled  = (state === 'stopped' || state === 'ready' || state === 'complete');
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  MODO RECARGA
+// ═══════════════════════════════════════════════════════════════
+function updateReloadCalc() {
+    const len = parseFloat(document.getElementById('reloadLen').value) || 0;
+    document.getElementById('reloadCalcTurns').textContent = Math.ceil(len / 30);
+}
+
+function reloadStart() {
+    const len = parseFloat(document.getElementById('reloadLen').value);
+    if (!len || len < 10) { showReloadToast('✗ Longitud inválida (mín 10 cm)', 'error'); return; }
+    postControl({ cmd: 'reload_start', length_cm: len,
+                  target_turns: Math.ceil(len / 30),
+                  speed: parseInt(document.getElementById('speed').value) || 70 });
+    showReloadToast('⟳ Iniciando recarga...', 'warning');
+}
+function reloadPause() { postControl({ cmd: 'reload_pause' }); }
+function reloadReset() {
+    postControl({ cmd: 'reload_reset' });
+    document.getElementById('reloadProgressContainer').style.display = 'none';
+    document.getElementById('reloadInfoGrid').style.display          = 'none';
+    document.getElementById('reloadStateDisplay').style.display      = 'none';
+    showReloadToast('Recarga cancelada', 'warning');
+}
+
+function updateReloadUI(data) {
+    const modo   = data.modo  || 'bobinado';
+    const rDone  = data.reload_done       || 0;
+    const rTotal = data.reload_target     || 0;
+    const rLen   = data.reload_length_cm  || 0;
+    const state  = data.state || 'ready';
+
+    if (modo === 'recarga') {
+        document.getElementById('reloadStateDisplay').style.display      = 'block';
+        document.getElementById('reloadProgressContainer').style.display = 'block';
+        document.getElementById('reloadInfoGrid').style.display          = 'grid';
+
+        const labels = { running:'RECARGANDO', paused:'PAUSADO', complete:'COMPLETO ✔',
+                         stopped:'DETENIDO', emergency:'EMERGENCIA' };
+        document.getElementById('reloadStateText').textContent = labels[state] || state.toUpperCase();
+
+        const pct = rTotal > 0 ? Math.round(rDone / rTotal * 100) : 0;
+        document.getElementById('reloadProgressBar').style.width  = pct + '%';
+        document.getElementById('reloadProgressText').textContent = pct + '%';
+        document.getElementById('reloadDone').textContent         = rDone;
+        document.getElementById('reloadTarget').textContent       = rTotal;
+        document.getElementById('reloadLenDisplay').textContent   = rLen + ' cm';
+        document.getElementById('btnReloadPause').disabled        = (state !== 'running');
+
+        if (state === 'complete') showReloadToast('✔ Recarga completada — ' + rLen + ' cm', 'success');
+    } else {
+        document.getElementById('btnReloadPause').disabled = true;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  BLOQUEO POR FILAMENTO
+// ═══════════════════════════════════════════════════════════════
+function applySystemBlock(filamentLockActive, reloadRequired) {
+    const banner = document.getElementById('globalBlockBanner');
+    if (filamentLockActive) {
+        banner.innerHTML = '🔒 &nbsp; SIN FILAMENTO — SISTEMA BLOQUEADO &nbsp; 🔒 &nbsp;&nbsp;|&nbsp;&nbsp; Inserte alambre para habilitar la recarga';
+        banner.style.background = '#c0392b'; banner.className = 'active';
+    } else if (reloadRequired) {
+        banner.innerHTML = '♻ &nbsp; RECARGA OBLIGATORIA — Complete la recarga para volver al modo normal';
+        banner.style.background = '#e67e22'; banner.className = 'active';
+    } else {
+        banner.className = ''; banner.style.background = '#c0392b';
+    }
+
+    const blocked = filamentLockActive || reloadRequired;
+    ['overlayParams','overlayOp','overlayStatus'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.className = 'block-overlay' + (blocked ? ' active' : '');
+    });
+
+    const rc = document.getElementById('reloadCard');
+    if (rc) {
+        rc.style.opacity       = filamentLockActive ? '0.35' : '1';
+        rc.style.pointerEvents = filamentLockActive ? 'none'  : 'auto';
+    }
+    const cancelBtn = document.getElementById('btnReloadCancel');
+    if (cancelBtn) {
+        cancelBtn.disabled = reloadRequired;
+        cancelBtn.title    = reloadRequired ? 'Complete la recarga primero' : '';
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  POLLING HTTP — actualiza estado cada 1 segundo
+// ═══════════════════════════════════════════════════════════════
+function updateStatus() {
+    // ── Fetch estado principal ───────────────────────────────────────────────
+    fetch('/status')
+        .then(r => r.json())
+        .then(data => {
+            setSrvBadge(true);
+            currentState  = data.state   || 'ready';
+            endstopActive = data.endstop || false;
+
+            document.getElementById('stateDisplay').textContent      = currentState.toUpperCase();
+            document.getElementById('turnsDone').textContent         = data.turns_done      || 0;
+            document.getElementById('turnsRemaining').textContent    = data.turns_remaining || 0;
+            document.getElementById('turnsTotal').textContent        = data.turns_total     || 0;
+            document.getElementById('speedValue').textContent        = (data.speed || 0) + '%';
+
+            const pct = (data.turns_total || 0) > 0
+                ? Math.round((data.turns_done / data.turns_total) * 100) : 0;
+            document.getElementById('progressBar').style.width   = pct + '%';
+            document.getElementById('progressText').textContent  = pct + '%';
+
+            const endEl = document.getElementById('endstopStatus');
+            endEl.textContent = data.endstop ? 'ON' : 'OFF';
+            endEl.className   = data.endstop ? 'sensor-status sensor-active' : 'sensor-status';
+
+            const hallEl = document.getElementById('hallStatus');
+            hallEl.textContent = data.hall ? 'ON' : 'OFF';
+            hallEl.className   = data.hall ? 'sensor-status sensor-active' : 'sensor-status';
+
+            updateButtons(currentState);
+            updateChecklist();
+            updateReloadUI(data);
+            applySystemBlock(data.filament_lock_active || false, data.reload_required || false);
+
+            if (currentState === 'emergency')
+                showToast('⚠ EMERGENCIA — Motor detenido por falta de filamento.', 'error');
         })
+        .catch(() => setSrvBadge(false));
 
-    def cmd_reload_pause(self):
-        """Pausa/reanuda la recarga en curso."""
-        self.mqtt_worker.publish({"cmd": "reload_pause"})
+    // ── Fetch resultado de cálculo ────────────────────────────────────────────
+    fetch('/calculation')
+        .then(r => r.json())
+        .then(data => {
+            if (!data.wire_length_m || data.wire_length_m <= 0) return;
+            calcDone   = true;
+            calcResult = data;
 
-    def cmd_reload_reset(self):
-        """Cancela la recarga y vuelve al modo bobinado."""
-        self.mqtt_worker.publish({"cmd": "reload_reset"})
+            document.getElementById('resultsPanel').style.display     = 'block';
+            document.getElementById('wireLength').textContent         = data.wire_length_m.toFixed(2) + ' m';
+            document.getElementById('turnsPerLayer').textContent      = data.turns_per_layer;
+            document.getElementById('maxLayers').textContent          = data.max_layers;
+            document.getElementById('totalCapacity').textContent      = data.total_capacity;
 
-    # =========================================================================
-    #  CIERRE
-    # =========================================================================
-    def closeEvent(self, event):
-        self.mqtt_worker.disconnect()
-        super().closeEvent(event)
+            const warnEl = document.getElementById('warningMsg');
+            if (data.warning) {
+                warnEl.textContent = '⚠ ' + data.warning;
+                if (!calcToastShown) {
+                    showToast(`⚠ ${data.warning} — máx ${data.total_capacity} vueltas`, 'warning');
+                    calcToastShown = true;
+                }
+            } else if (!calcToastShown) {
+                warnEl.textContent = '';
+                showToast(`✔ Cálculo OK — ${data.wire_length_m.toFixed(2)}m de cobre necesarios`, 'success');
+                calcToastShown = true;
+            }
+            updateChecklist();
+        });
+}
 
+function setSrvBadge(online) {
+    const el = document.getElementById('srvBadge');
+    if (online) { el.className = 'srv-badge online';  el.textContent = '● SERVIDOR OK'; }
+    else        { el.className = 'srv-badge offline'; el.textContent = '○ SIN SERVIDOR'; }
+}
 
-# =============================================================================
-#  PUNTO DE ENTRADA
-# =============================================================================
-def main():
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
+// ═══════════════════════════════════════════════════════════════
+//  INIT
+// ═══════════════════════════════════════════════════════════════
+window.onload = () => {
+    Object.keys(FIELD_RULES).forEach(id => validateField(document.getElementById(id)));
+    updateChecklist();
+    updateReloadCalc();
+};
 
-    # Paleta clara — compatible con PySide6 6.4+
-    palette = app.palette()
-    palette.setColor(QPalette.ColorRole.Window,        QColor(245, 245, 248))
-    palette.setColor(QPalette.ColorRole.WindowText,    QColor(30,  30,  30))
-    palette.setColor(QPalette.ColorRole.Base,          QColor(255, 255, 255))
-    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(235, 235, 240))
-    palette.setColor(QPalette.ColorRole.Button,        QColor(220, 220, 225))
-    palette.setColor(QPalette.ColorRole.ButtonText,    QColor(30,  30,  30))
-    app.setPalette(palette)
+setInterval(updateStatus, 1000);
+</script>
+</body>
+</html>"""
 
-    win = MainWindow()
-    win.show()
-    sys.exit(app.exec())
+# ─────────────────────────────────────────────────────────────────────────────
+#  RUTAS FLASK
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
 
+@app.route('/control', methods=['POST'])
+def control():
+    data = request.get_json()
+    mqtt_client.publish(TOPIC_CMD, json.dumps(data))
+    print(f"[MQTT→CMD] {json.dumps(data)}")
+    return jsonify({'status': 'ok', 'command': data})
 
-if __name__ == "__main__":
-    main()
+@app.route('/status')
+def status():
+    payload = dict(latest_status)
+    payload['calculation'] = calculation_result
+    return jsonify(payload)
+
+@app.route('/calculation')
+def calculation():
+    return jsonify(calculation_result)
+
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    print("=" * 60)
+    print("  SERVIDOR EMBOBINADORA INDUSTRIAL")
+    print("=" * 60)
+    print(f"  MQTT Broker : {MQTT_BROKER}:{MQTT_PORT}")
+    print(f"  CMD topic   : {TOPIC_CMD}")
+    print(f"  STATUS topic: {TOPIC_STATUS}")
+    print(f"  Web UI      : http://localhost:5000")
+    print(f"  Red local   : http://0.0.0.0:5000")
+    print("=" * 60)
+    app.run(host='0.0.0.0', port=5000, debug=True)
